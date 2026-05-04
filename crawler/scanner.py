@@ -1,20 +1,22 @@
 """
-PRO Scanner - 하이브리드 쇼핑몰 신상품 크롤러 (v3)
+PRO Scanner - 순수 크롤링 버전 (v4, Gemini 제거)
 ========================================================
-v3 개선 사항:
-  - 사이트당 최대 처리 시간 60초 제한 (시간 초과 방지)
-  - 무신사 사이트 먼저 처리 (Gemini 안 쓰니까 빨리 끝남)
-  - 진행 상황 실시간 출력 (타임아웃되어도 어디서 멈췄는지 알 수 있음)
+v4 변경 사항:
+  - Gemini API 완전 제거 (429 문제 근본 해결)
+  - 무신사 제거
+  - 사이트별 전용 파서 추가 (나이키, 카시나)
+  - 범용 HTML 파서 강화 (JSON-LD, 상품 링크 패턴)
 
-실행 흐름:
-  1. Firestore 에서 등록된 사이트 목록 가져오기
-  2. 무신사 사이트 먼저, 일반 사이트 나중에 정렬
-  3. 각 사이트별로 최대 60초 안에 다음 시도:
-     (a) URL 이 musinsa.com/brand/* → 무신사 전용 API
-     (b) RSS 피드 → 파싱
-     (c) sitemap.xml → 파싱
-     (d) 모두 실패 → Gemini LLM (5초 딜레이 + 자동 재시도)
-  4. 신상품 추출 → Firestore 업데이트 → 텔레그램 알림
+크롤링 전략 순서:
+  1. RSS 피드    (Shopify 계열 → .atom, 일반 RSS/feed.xml)
+  2. sitemap.xml (상품 URL 패턴 필터링)
+  3. JSON-LD     (페이지에 내장된 구조화 데이터)
+  4. 사이트별 전용 파서 (나이키, 카시나 등)
+  5. 범용 HTML 파서 (상품 링크 패턴 추출)
+
+실패 처리:
+  - 파페치 등 봇 차단 사이트 → 빠르게 실패 처리 (시간 낭비 X)
+  - 사이트당 최대 45초 제한
 """
 
 import os
@@ -36,40 +38,38 @@ from firebase_admin import credentials, firestore
 # ======================================================================
 # 환경 변수
 # ======================================================================
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 FIREBASE_CREDENTIALS_JSON = os.environ.get("FIREBASE_CREDENTIALS_JSON", "").strip()
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 APP_ID = os.environ.get("APP_ID", "drake130-app").strip()
 
-GEMINI_MODEL = "gemini-2.0-flash"
-GEMINI_URL = (
-    f"https://generativelanguage.googleapis.com/v1beta/models/"
-    f"{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
-)
-
-GEMINI_MIN_INTERVAL = 5.0
-PER_SITE_TIMEOUT = 60  # 사이트당 최대 처리 시간 (초)
-_last_gemini_call_time = 0.0
+PER_SITE_TIMEOUT = 45  # 사이트당 최대 처리 시간 (초)
+REQUEST_TIMEOUT = 12
 
 HTTP_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/120.0.0.0 Safari/537.36"
+        "Chrome/124.0.0.0 Safari/537.36"
     ),
-    "Accept-Language": "ko-KR,ko;q=0.9,en;q=0.8",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
 }
 
-REQUEST_TIMEOUT = 15
+# 봇 차단이 강해서 현실적으로 크롤링 불가능한 도메인
+BLOCKED_DOMAINS = [
+    "farfetch.com",      # 봇 차단 최강
+    "ssense.com",        # 봇 차단 강함
+]
 
 
 # ======================================================================
-# 사이트별 타임아웃 (signal 이용)
+# 사이트별 타임아웃
 # ======================================================================
 class SiteTimeout(Exception):
     pass
-
 
 def _timeout_handler(signum, frame):
     raise SiteTimeout()
@@ -91,150 +91,15 @@ def init_firebase():
 
 
 # ======================================================================
-# 무신사 전용 크롤러
+# 봇 차단 사이트 빠른 확인
 # ======================================================================
-def is_musinsa(url: str) -> bool:
-    return "musinsa.com" in urlparse(url).netloc.lower()
-
-
-def try_musinsa(site_url: str):
-    if not is_musinsa(site_url):
-        return None
-
-    parsed = urlparse(site_url)
-    path_parts = [p for p in parsed.path.split("/") if p]
-    if len(path_parts) < 2 or path_parts[0] != "brand":
-        return None
-    brand_id = path_parts[1]
-
-    print(f"  [무신사] 브랜드: {brand_id}")
-
-    musinsa_headers = {
-        **HTTP_HEADERS,
-        "Accept": "application/json",
-        "Referer": site_url,
-    }
-
-    api_candidates = [
-        f"https://api.musinsa.com/api2/hm/web/v5/brands/goods?brand={brand_id}&size=10&page=1&sort=new&listViewType=small",
-        f"https://api.musinsa.com/api2/hm/web/v6/brand/{brand_id}/goods?gf=A&size=10&page=1&sort=new",
-        f"https://www.musinsa.com/api/brand/{brand_id}/goods?size=10&sort=new",
-    ]
-
-    for api_url in api_candidates:
-        try:
-            resp = requests.get(api_url, headers=musinsa_headers, timeout=REQUEST_TIMEOUT)
-            if resp.status_code != 200:
-                continue
-            data = resp.json()
-            items = _extract_musinsa_items(data, brand_id)
-            if items:
-                print(f"  ✓ 무신사 API 성공")
-                return items[:10]
-        except Exception:
-            continue
-
-    print(f"  무신사 API 실패, HTML 파싱 시도")
-    return _try_musinsa_html(site_url, brand_id)
-
-
-def _extract_musinsa_items(data, brand_id):
-    candidates = []
-
-    def find_lists(obj, depth=0):
-        if depth > 5:
-            return
-        if isinstance(obj, list):
-            if obj and isinstance(obj[0], dict):
-                first = obj[0]
-                keys = set(first.keys())
-                if keys & {"goodsNo", "goods_no", "productNo", "id"} and \
-                   keys & {"goodsName", "goods_name", "productName", "name", "title"}:
-                    candidates.append(obj)
-        elif isinstance(obj, dict):
-            for v in obj.values():
-                find_lists(v, depth + 1)
-
-    find_lists(data)
-    if not candidates:
-        return []
-
-    products = max(candidates, key=len)
-    items = []
-    for p in products[:10]:
-        name = (
-            p.get("goodsName") or p.get("goods_name") or
-            p.get("productName") or p.get("name") or p.get("title") or ""
-        )
-        goods_no = (
-            p.get("goodsNo") or p.get("goods_no") or
-            p.get("productNo") or p.get("id") or ""
-        )
-        if name and goods_no:
-            items.append({
-                "name": str(name).strip(),
-                "link": f"https://www.musinsa.com/products/{goods_no}",
-            })
-    return items
-
-
-def _try_musinsa_html(site_url: str, brand_id: str):
-    try:
-        resp = requests.get(site_url, headers=HTTP_HEADERS, timeout=REQUEST_TIMEOUT)
-        if resp.status_code != 200:
-            return None
-
-        soup = BeautifulSoup(resp.text, "html.parser")
-        next_data_tag = soup.find("script", id="__NEXT_DATA__")
-        if next_data_tag and next_data_tag.string:
-            try:
-                next_data = json.loads(next_data_tag.string)
-                items = _extract_musinsa_items(next_data, brand_id)
-                if items:
-                    print(f"  ✓ 무신사 __NEXT_DATA__ 파싱 성공")
-                    return items
-            except Exception:
-                pass
-
-        product_links = soup.find_all("a", href=re.compile(r"/products/\d+"))
-        seen = set()
-        items = []
-        for a in product_links:
-            href = a.get("href", "")
-            match = re.search(r"/products/(\d+)", href)
-            if not match:
-                continue
-            goods_no = match.group(1)
-            if goods_no in seen:
-                continue
-            seen.add(goods_no)
-
-            name = a.get_text(strip=True) or ""
-            if not name:
-                img = a.find("img")
-                if img:
-                    name = img.get("alt", "")
-            if not name:
-                continue
-
-            items.append({
-                "name": name[:100],
-                "link": urljoin("https://www.musinsa.com", href.split("?")[0]),
-            })
-            if len(items) >= 10:
-                break
-
-        if items:
-            print(f"  ✓ 무신사 HTML 파싱 성공: {len(items)}개")
-            return items
-    except Exception as e:
-        print(f"  무신사 HTML 파싱 실패: {e}")
-
-    return None
+def is_blocked_domain(url: str) -> bool:
+    hostname = urlparse(url).netloc.lower()
+    return any(blocked in hostname for blocked in BLOCKED_DOMAINS)
 
 
 # ======================================================================
-# RSS 피드
+# 전략 1: RSS / Atom 피드
 # ======================================================================
 def try_rss(site_url: str):
     try:
@@ -243,54 +108,55 @@ def try_rss(site_url: str):
             return None
 
         soup = BeautifulSoup(resp.text, "html.parser")
-        rss_link = soup.find(
-            "link",
-            attrs={"type": re.compile(r"application/(rss|atom)\+xml")},
-        )
 
         candidates = []
+
+        # <link rel="alternate"> 태그에서 RSS 찾기
+        rss_link = soup.find("link", attrs={"type": re.compile(r"application/(rss|atom)\+xml")})
         if rss_link and rss_link.get("href"):
             candidates.append(urljoin(site_url, rss_link["href"]))
 
-        for path in ["/rss", "/feed", "/rss.xml", "/feed.xml"]:
+        # 흔한 경로 + Shopify .atom 패턴
+        for path in ["/rss", "/feed", "/rss.xml", "/feed.xml", "/atom.xml"]:
             candidates.append(urljoin(site_url, path))
 
+        # Shopify collection URL 은 .atom 을 붙이면 바로 피드
         if "/collections/" in site_url:
-            candidates.append(site_url.rstrip("/") + ".atom")
+            candidates.append(site_url.rstrip("/").split("?")[0] + ".atom")
 
         for rss_url in candidates:
-            items = _parse_rss(rss_url)
+            items = _parse_feed(rss_url)
             if items:
                 print(f"  ✓ RSS: {rss_url}")
                 return items[:10]
+
     except Exception as e:
         print(f"  RSS 실패: {e}")
 
     return None
 
 
-def _parse_rss(rss_url: str):
+def _parse_feed(feed_url: str):
     try:
-        resp = requests.get(rss_url, headers=HTTP_HEADERS, timeout=REQUEST_TIMEOUT)
-        if resp.status_code != 200 or len(resp.content) < 50:
+        resp = requests.get(feed_url, headers=HTTP_HEADERS, timeout=REQUEST_TIMEOUT)
+        if resp.status_code != 200 or len(resp.content) < 100:
             return None
 
         root = ET.fromstring(resp.content)
         items = []
 
-        for item in root.iter():
-            tag = item.tag.split("}")[-1].lower()
-            if tag != "item" and tag != "entry":
+        for node in root.iter():
+            tag = node.tag.split("}")[-1].lower()
+            if tag not in ("item", "entry"):
                 continue
 
-            title = None
-            link = None
-            for child in item:
+            title = link = None
+            for child in node:
                 ctag = child.tag.split("}")[-1].lower()
                 if ctag == "title" and child.text:
                     title = child.text.strip()
                 elif ctag == "link":
-                    link = child.text.strip() if child.text else child.get("href")
+                    link = child.text.strip() if child.text else child.get("href", "")
 
             if title and link:
                 items.append({"name": title, "link": link})
@@ -301,7 +167,7 @@ def _parse_rss(rss_url: str):
 
 
 # ======================================================================
-# sitemap.xml
+# 전략 2: sitemap.xml
 # ======================================================================
 def try_sitemap(site_url: str):
     try:
@@ -313,55 +179,62 @@ def try_sitemap(site_url: str):
         root = ET.fromstring(resp.content)
         ns = {"sm": "http://www.sitemaps.org/schemas/sitemap/0.9"}
 
-        urls_with_dates = []
+        all_urls = []
+
+        # sitemap index 형식 처리
         sitemaps = root.findall("sm:sitemap", ns)
         if sitemaps:
-            for sm in sitemaps[:3]:
+            for sm in sitemaps[:5]:
                 loc = sm.find("sm:loc", ns)
                 if loc is not None and loc.text:
-                    sub_items = _parse_sitemap_urls(loc.text.strip())
-                    if sub_items:
-                        urls_with_dates.extend(sub_items)
+                    all_urls.extend(_fetch_sitemap_urls(loc.text.strip()))
         else:
-            urls_with_dates = _parse_sitemap_urls_from_root(root, ns)
+            all_urls = _parse_sitemap_root(root, ns)
 
-        if not urls_with_dates:
+        if not all_urls:
             return None
 
-        product_pattern = re.compile(r"(product|item|goods|/p/|/dp/)", re.IGNORECASE)
-        filtered = [u for u in urls_with_dates if product_pattern.search(u["link"])]
+        # 상품 URL 패턴 필터
+        product_re = re.compile(
+            r"(/product|/goods|/item|/p/|/pd/|/dp/|cate_no|category|list\.html)",
+            re.IGNORECASE
+        )
+        filtered = [u for u in all_urls if product_re.search(u["link"])]
         if not filtered:
-            filtered = urls_with_dates
+            filtered = all_urls
 
+        # 최신순 정렬
         filtered.sort(key=lambda x: x.get("lastmod", ""), reverse=True)
 
         items = []
         for u in filtered[:10]:
-            name = u["link"].rstrip("/").split("/")[-1].replace("-", " ")[:80]
+            raw_name = u["link"].rstrip("/").split("/")[-1].split("?")[0]
+            name = re.sub(r"[-_]", " ", raw_name)[:80] or u["link"]
             items.append({"name": name, "link": u["link"]})
 
         if items:
             print(f"  ✓ sitemap")
             return items
+
     except Exception as e:
         print(f"  sitemap 실패: {e}")
 
     return None
 
 
-def _parse_sitemap_urls(sitemap_url: str):
+def _fetch_sitemap_urls(url: str):
     try:
-        resp = requests.get(sitemap_url, headers=HTTP_HEADERS, timeout=REQUEST_TIMEOUT)
+        resp = requests.get(url, headers=HTTP_HEADERS, timeout=REQUEST_TIMEOUT)
         if resp.status_code != 200:
             return []
         root = ET.fromstring(resp.content)
         ns = {"sm": "http://www.sitemaps.org/schemas/sitemap/0.9"}
-        return _parse_sitemap_urls_from_root(root, ns)
+        return _parse_sitemap_root(root, ns)
     except Exception:
         return []
 
 
-def _parse_sitemap_urls_from_root(root, ns):
+def _parse_sitemap_root(root, ns):
     results = []
     for url_el in root.findall("sm:url", ns):
         loc = url_el.find("sm:loc", ns)
@@ -375,127 +248,380 @@ def _parse_sitemap_urls_from_root(root, ns):
 
 
 # ======================================================================
-# Gemini LLM 폴백 (재시도 횟수 줄임)
+# 전략 3: JSON-LD (페이지에 내장된 구조화 데이터)
 # ======================================================================
-def try_gemini(site_url: str):
-    if not GEMINI_API_KEY:
-        return None
-
+def try_jsonld(site_url: str):
+    """
+    많은 쇼핑몰이 SEO 용으로 JSON-LD 형식의 상품 데이터를 HTML 에 내장함.
+    script type="application/ld+json" 에서 ItemList 또는 Product 타입 추출.
+    """
     try:
         resp = requests.get(site_url, headers=HTTP_HEADERS, timeout=REQUEST_TIMEOUT)
         if resp.status_code != 200:
-            print(f"  페이지 가져오기 실패: HTTP {resp.status_code}")
             return None
 
         soup = BeautifulSoup(resp.text, "html.parser")
-        for tag in soup(["script", "style", "nav", "footer", "header"]):
-            tag.decompose()
+        scripts = soup.find_all("script", {"type": "application/ld+json"})
 
-        page_text = str(soup)[:25000]
-
-        prompt = f"""아래는 쇼핑몰 페이지의 HTML 입니다. 현재 표시된 신상품 또는 최신 상품 10개를 추출해주세요.
-
-규칙:
-- 상품명(name)과 절대경로 URL(link)만 반환
-- 카테고리·메뉴·배너 링크 제외, 실제 개별 상품만
-- 상대경로는 {site_url} 기준으로 절대경로로 변환
-- JSON 형식: {{"products": [{{"name": "...", "link": "..."}}]}}
-
-HTML:
-{page_text}
-"""
-
-        # 재시도는 2회만 (시간 절약)
-        for attempt in range(2):
-            _wait_for_gemini_quota()
-
-            api_resp = requests.post(
-                GEMINI_URL,
-                headers={"Content-Type": "application/json"},
-                json={
-                    "contents": [{"parts": [{"text": prompt}]}],
-                    "generationConfig": {
-                        "responseMimeType": "application/json",
-                        "temperature": 0.1,
-                    },
-                },
-                timeout=45,
-            )
-
-            if api_resp.status_code == 200:
-                break
-
-            if api_resp.status_code in (429, 500, 502, 503, 504) and attempt < 1:
-                wait = 20  # 20초만 기다림
-                print(f"  Gemini HTTP {api_resp.status_code} → {wait}초 후 재시도")
-                time.sleep(wait)
+        items = []
+        for script in scripts:
+            if not script.string:
+                continue
+            try:
+                data = json.loads(script.string)
+                # 리스트로 감싸진 경우도 처리
+                if isinstance(data, list):
+                    for d in data:
+                        items.extend(_extract_jsonld_products(d, site_url))
+                else:
+                    items.extend(_extract_jsonld_products(data, site_url))
+            except Exception:
                 continue
 
-            print(f"  Gemini API 실패: HTTP {api_resp.status_code}")
-            return None
-        else:
-            return None
+        if items:
+            print(f"  ✓ JSON-LD: {len(items)}개")
+            return items[:10]
 
-        result = api_resp.json()
-        text = (
-            result.get("candidates", [{}])[0]
-            .get("content", {})
-            .get("parts", [{}])[0]
-            .get("text", "")
-        )
-        if not text:
-            return None
-
-        data = json.loads(text)
-        products = data.get("products", [])
-
-        for p in products:
-            if p.get("link") and not p["link"].startswith("http"):
-                p["link"] = urljoin(site_url, p["link"])
-
-        if products:
-            print(f"  ✓ Gemini: {len(products)}개")
-            return products[:10]
     except Exception as e:
-        print(f"  Gemini 실패: {e}")
+        print(f"  JSON-LD 실패: {e}")
 
     return None
 
 
-def _wait_for_gemini_quota():
-    global _last_gemini_call_time
-    elapsed = time.time() - _last_gemini_call_time
-    if elapsed < GEMINI_MIN_INTERVAL:
-        time.sleep(GEMINI_MIN_INTERVAL - elapsed)
-    _last_gemini_call_time = time.time()
+def _extract_jsonld_products(data: dict, base_url: str):
+    items = []
+    dtype = data.get("@type", "")
+
+    # ItemList 타입: 상품 목록
+    if dtype == "ItemList":
+        for element in data.get("itemListElement", []):
+            item = element.get("item", element)
+            name = item.get("name", "")
+            url = item.get("url", "")
+            if name and url:
+                if not url.startswith("http"):
+                    url = urljoin(base_url, url)
+                items.append({"name": name, "link": url})
+
+    # Product 타입: 개별 상품 (목록 페이지에서 여러 개 나올 수도 있음)
+    elif dtype == "Product":
+        name = data.get("name", "")
+        url = data.get("url", base_url)
+        if name:
+            items.append({"name": name, "link": url})
+
+    # @graph 패턴
+    for node in data.get("@graph", []):
+        items.extend(_extract_jsonld_products(node, base_url))
+
+    return items
 
 
 # ======================================================================
-# 메인 크롤링 (사이트당 타임아웃 60초)
+# 전략 4: 사이트별 전용 파서
 # ======================================================================
-def crawl_site_with_timeout(site_url: str):
-    """사이트당 최대 60초 안에 결과 반환"""
+def try_site_specific(site_url: str):
+    """등록된 사이트별 전용 파서 시도"""
+    hostname = urlparse(site_url).netloc.lower()
+
+    if "nike.com" in hostname:
+        return _parse_nike(site_url)
+    if "kasina.co.kr" in hostname:
+        return _parse_kasina(site_url)
+
+    return None
+
+
+def _parse_nike(url: str):
+    """
+    나이키는 내부 API로 상품 데이터를 가져옴.
+    Wall 페이지 URL 에서 thread ID 추출 → API 호출.
+    """
+    try:
+        # 나이키 공개 검색 API (로그인 불필요)
+        # URL 에서 카테고리 코드 추출 시도
+        # 예: /kr/w/new-releases-men-3n82yznik1 → 3n82yznik1
+
+        wall_match = re.search(r'/w/[^/]+-([a-z0-9]+)$', url)
+        if wall_match:
+            wall_id = wall_match.group(1)
+            api_url = (
+                f"https://api.nike.com/cics/browse/v2"
+                f"?queryid=products&anonymousId=0&country=kr&channel=NIKE"
+                f"&language=ko&localizedRangeStr={{minRange}}%20~%20{{maxRange}}"
+                f"&consumer=wall&subType=facets&facets=true"
+                f"&filter=wall({wall_id})&filter=marketplace(KR)"
+                f"&sort=newest&fields=active,id,title,product_type,pdp_url,images"
+                f"&count=10"
+            )
+            nike_headers = {
+                **HTTP_HEADERS,
+                "Accept": "application/json",
+                "Referer": "https://www.nike.com/",
+            }
+            resp = requests.get(api_url, headers=nike_headers, timeout=REQUEST_TIMEOUT)
+            if resp.status_code == 200:
+                data = resp.json()
+                products = data.get("data", {}).get("products", {}).get("products", [])
+                if products:
+                    items = []
+                    for p in products[:10]:
+                        name = p.get("title", "")
+                        pdp = p.get("pdp_url", "")
+                        if name and pdp:
+                            link = f"https://www.nike.com{pdp}" if pdp.startswith("/") else pdp
+                            items.append({"name": name, "link": link})
+                    if items:
+                        print(f"  ✓ 나이키 API: {len(items)}개")
+                        return items
+
+        # API 실패 시 HTML에서 JSON 데이터 추출 (Next.js __NEXT_DATA__)
+        resp = requests.get(url, headers=HTTP_HEADERS, timeout=REQUEST_TIMEOUT)
+        if resp.status_code == 200:
+            soup = BeautifulSoup(resp.text, "html.parser")
+            next_data = soup.find("script", id="__NEXT_DATA__")
+            if next_data and next_data.string:
+                data = json.loads(next_data.string)
+                # 재귀적으로 products 배열 찾기
+                items = _deep_find_products(data, url)
+                if items:
+                    print(f"  ✓ 나이키 HTML 파싱: {len(items)}개")
+                    return items
+
+    except Exception as e:
+        print(f"  나이키 파서 실패: {e}")
+
+    return None
+
+
+def _parse_kasina(url: str):
+    """카시나 전용 파서"""
+    try:
+        resp = requests.get(url, headers=HTTP_HEADERS, timeout=REQUEST_TIMEOUT)
+        if resp.status_code != 200:
+            return None
+
+        soup = BeautifulSoup(resp.text, "html.parser")
+
+        items = []
+        seen = set()
+
+        # 카시나 상품 링크 패턴: /goods/숫자 또는 /product/숫자
+        product_links = soup.find_all("a", href=re.compile(r"/(goods|product)/\d+"))
+
+        for a in product_links:
+            href = a.get("href", "")
+            if not href:
+                continue
+
+            link = urljoin("https://www.kasina.co.kr", href.split("?")[0])
+            if link in seen:
+                continue
+            seen.add(link)
+
+            # 상품명: img alt 또는 텍스트
+            name = ""
+            img = a.find("img")
+            if img:
+                name = img.get("alt", "").strip()
+            if not name:
+                name = a.get_text(separator=" ", strip=True)[:80]
+            if not name:
+                continue
+
+            items.append({"name": name, "link": link})
+            if len(items) >= 10:
+                break
+
+        if items:
+            print(f"  ✓ 카시나 HTML: {len(items)}개")
+            return items
+
+    except Exception as e:
+        print(f"  카시나 파서 실패: {e}")
+
+    return None
+
+
+def _deep_find_products(data, base_url, depth=0):
+    """JSON 구조에서 상품 배열을 재귀적으로 탐색"""
+    if depth > 8:
+        return []
+    if isinstance(data, list):
+        if data and isinstance(data[0], dict):
+            keys = set(data[0].keys())
+            if keys & {"title", "name", "productName"} and keys & {"url", "pdp_url", "href", "link"}:
+                items = []
+                for p in data[:10]:
+                    name = p.get("title") or p.get("name") or p.get("productName") or ""
+                    link = p.get("url") or p.get("pdp_url") or p.get("href") or p.get("link") or ""
+                    if name and link:
+                        if not link.startswith("http"):
+                            link = urljoin(base_url, link)
+                        items.append({"name": str(name).strip(), "link": link})
+                if items:
+                    return items
+        for item in data:
+            result = _deep_find_products(item, base_url, depth + 1)
+            if result:
+                return result
+    elif isinstance(data, dict):
+        for v in data.values():
+            result = _deep_find_products(v, base_url, depth + 1)
+            if result:
+                return result
+    return []
+
+
+# ======================================================================
+# 전략 5: 범용 HTML 파서
+# ======================================================================
+def try_generic_html(site_url: str):
+    """
+    상품 링크 패턴을 찾아서 이름+링크 추출.
+    대부분의 쇼핑몰에서 동작하는 범용 방식.
+    """
+    try:
+        resp = requests.get(site_url, headers=HTTP_HEADERS, timeout=REQUEST_TIMEOUT)
+        if resp.status_code != 200:
+            print(f"  HTML 가져오기 실패: HTTP {resp.status_code}")
+            return None
+
+        soup = BeautifulSoup(resp.text, "html.parser")
+
+        # 스크립트/스타일 제거
+        for tag in soup(["script", "style", "nav", "footer", "header", "aside"]):
+            tag.decompose()
+
+        domain = urlparse(site_url).netloc
+        items = []
+        seen_links = set()
+        seen_names = set()
+
+        # 상품 링크 패턴
+        product_re = re.compile(
+            r"/(product|goods|item|pd|shop|buy|detail|view)[s]?/|"
+            r"cate_no=|goods_no=|product_no=|item_no=|"
+            r"/p/[a-z0-9-]{4,}|"
+            r"list\.html\?",
+            re.IGNORECASE
+        )
+
+        all_links = soup.find_all("a", href=True)
+
+        for a in all_links:
+            href = a.get("href", "")
+            if not href or href.startswith(("#", "javascript", "mailto", "tel")):
+                continue
+
+            # 절대경로 변환
+            if href.startswith("//"):
+                href = "https:" + href
+            elif href.startswith("/"):
+                href = urljoin(site_url, href)
+            elif not href.startswith("http"):
+                href = urljoin(site_url, href)
+
+            # 같은 도메인만
+            if domain not in urlparse(href).netloc:
+                continue
+
+            # 상품 패턴 확인
+            if not product_re.search(href):
+                continue
+
+            clean_link = href.split("?")[0].rstrip("/")
+            if clean_link in seen_links:
+                continue
+            seen_links.add(clean_link)
+
+            # 상품명 추출 시도
+            name = ""
+
+            # 1. img alt
+            img = a.find("img")
+            if img:
+                name = img.get("alt", "").strip()
+
+            # 2. 텍스트
+            if not name or len(name) < 2:
+                name = a.get_text(separator=" ", strip=True)
+
+            # 3. title 속성
+            if not name or len(name) < 2:
+                name = a.get("title", "").strip()
+
+            # 이름 정제
+            name = re.sub(r'\s+', ' ', name).strip()[:100]
+
+            # 너무 짧거나, 메뉴/카테고리 같은 이름은 제외
+            skip_words = re.compile(r'^(홈|HOME|MENU|메뉴|전체|ALL|더보기|BACK|이전|다음|장바구니|로그인)$', re.I)
+            if not name or len(name) < 3 or skip_words.match(name):
+                continue
+
+            if name in seen_names:
+                continue
+            seen_names.add(name)
+
+            items.append({"name": name, "link": href})
+            if len(items) >= 10:
+                break
+
+        if items:
+            print(f"  ✓ HTML 범용 파서: {len(items)}개")
+            return items
+
+    except Exception as e:
+        print(f"  HTML 범용 파서 실패: {e}")
+
+    return None
+
+
+# ======================================================================
+# 메인 크롤링 함수
+# ======================================================================
+def crawl_site(site_url: str):
+    """
+    전략 순서:
+      RSS → sitemap → JSON-LD → 사이트별 전용 → 범용 HTML
+    """
+    # 봇 차단 도메인은 즉시 건너뜀
+    if is_blocked_domain(site_url):
+        print(f"  ⚠ 봇 차단 도메인 (크롤링 불가) - 대시보드에서 수동 확인 권장")
+        return None
+
+    # 전략 순서대로 시도
+    strategies = [
+        ("RSS", try_rss),
+        ("sitemap", try_sitemap),
+        ("JSON-LD", try_jsonld),
+        ("사이트별 전용", try_site_specific),
+        ("범용 HTML", try_generic_html),
+    ]
+
+    for strategy_name, strategy_fn in strategies:
+        try:
+            result = strategy_fn(site_url)
+            if result:
+                return result
+        except Exception as e:
+            print(f"  {strategy_name} 예외: {e}")
+        time.sleep(0.3)
+
+    return None
+
+
+def crawl_with_timeout(site_url: str):
+    """사이트당 최대 45초"""
     signal.signal(signal.SIGALRM, _timeout_handler)
     signal.alarm(PER_SITE_TIMEOUT)
-
     try:
-        if is_musinsa(site_url):
-            result = try_musinsa(site_url)
-            if result:
-                return result
-            print(f"  무신사 전용 실패, 일반 전략 폴백")
-
-        for strategy in (try_rss, try_sitemap, try_gemini):
-            result = strategy(site_url)
-            if result:
-                return result
-            time.sleep(0.3)
-        return None
+        return crawl_site(site_url)
     except SiteTimeout:
-        print(f"  ⏱ 60초 초과 → 다음 사이트로 이동")
+        print(f"  ⏱ {PER_SITE_TIMEOUT}초 초과 → 다음 사이트로")
         return None
     finally:
-        signal.alarm(0)  # 타이머 해제
+        signal.alarm(0)
 
 
 # ======================================================================
@@ -505,9 +631,8 @@ def send_telegram(message: str):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
     try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
         requests.post(
-            url,
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
             json={
                 "chat_id": TELEGRAM_CHAT_ID,
                 "text": message,
@@ -521,75 +646,93 @@ def send_telegram(message: str):
 
 
 # ======================================================================
-# 메인 실행
+# 메인
 # ======================================================================
 def main():
     start_time = time.time()
-    print(f"=== PRO Scanner v3 시작 @ {datetime.now(timezone.utc).isoformat()} ===")
+    print(f"=== PRO Scanner v4 시작 @ {datetime.now(timezone.utc).isoformat()} ===")
+    print(f"    Gemini 없음 | 순수 크롤링 모드\n")
 
     db = init_firebase()
-    sites_ref = db.collection("artifacts").document(APP_ID) \
-                  .collection("public").document("data") \
-                  .collection("monitoring_sites")
+    sites_ref = (
+        db.collection("artifacts")
+        .document(APP_ID)
+        .collection("public")
+        .document("data")
+        .collection("monitoring_sites")
+    )
 
-    sites = list(sites_ref.stream())
-    if not sites:
+    raw_sites = list(sites_ref.stream())
+    if not raw_sites:
         print("등록된 사이트가 없습니다.")
         return
 
-    # ⭐ 무신사 사이트 먼저 처리 (Gemini 안 쓰니까 빨리 끝남)
-    sites_with_data = [(s, s.to_dict()) for s in sites]
-    sites_sorted = sorted(
-        sites_with_data,
-        key=lambda x: 0 if is_musinsa(x[1].get("url", "")) else 1
-    )
+    # 무신사 제외, 봇 차단 도메인은 맨 뒤로
+    def sort_key(doc):
+        url = doc.to_dict().get("url", "")
+        if "musinsa.com" in url:
+            return 2  # 무신사: 맨 뒤 (사실상 스킵)
+        if is_blocked_domain(url):
+            return 1  # 봇 차단: 뒤쪽
+        return 0
 
-    print(f"총 {len(sites_sorted)}개 사이트 스캔 시작 (무신사 우선)\n")
+    sites = sorted(raw_sites, key=sort_key)
 
-    total_new_count = 0
+    print(f"총 {len(sites)}개 사이트 스캔 시작\n")
+
     success_count = 0
     fail_count = 0
+    skip_count = 0
+    total_new = 0
 
-    for site_doc, site_data in sites_sorted:
-        elapsed_total = time.time() - start_time
-        if elapsed_total > 1500:  # 25분 경과 시 강제 종료
-            print(f"\n⚠ 전체 25분 경과 → 남은 사이트 스킵")
+    for site_doc in sites:
+        elapsed = time.time() - start_time
+        if elapsed > 22 * 60:  # 22분 초과 시 중단
+            print(f"\n⚠ 22분 경과 → 조기 종료")
             break
 
+        data = site_doc.to_dict()
         site_id = site_doc.id
-        name = site_data.get("name", "(이름 없음)")
-        url = site_data.get("url", "")
-        previous_items = site_data.get("items", []) or []
+        name = data.get("name", "(이름 없음)")
+        url = data.get("url", "")
+        prev_items = data.get("items", []) or []
 
         print(f"[{name}] {url}")
 
         if not url:
-            print("  URL 비어있음")
+            skip_count += 1
             continue
 
-        site_start = time.time()
-        fetched = crawl_site_with_timeout(url)
-        site_elapsed = time.time() - site_start
+        # 무신사는 스킵
+        if "musinsa.com" in url:
+            print(f"  → 무신사 제외 (직접 확인 권장)")
+            skip_count += 1
+            continue
+
+        t0 = time.time()
+        fetched = crawl_with_timeout(url)
+        elapsed_site = time.time() - t0
 
         if not fetched:
-            print(f"  ✗ 크롤링 실패 ({site_elapsed:.1f}s)")
+            print(f"  ✗ 실패 ({elapsed_site:.1f}s)")
             sites_ref.document(site_id).update({
-                "lastError": "크롤링 실패",
+                "lastError": "크롤링 실패 (모든 전략 응답 없음)",
                 "lastErrorAt": datetime.now(timezone.utc).isoformat(),
             })
             fail_count += 1
             continue
 
-        if previous_items:
+        # 신상품 비교
+        new_items = []
+        if prev_items:
+            prev_keys = {(p.get("link", ""), p.get("name", "")) for p in prev_items}
             new_items = [
                 f for f in fetched
                 if not any(
                     p.get("link") == f.get("link") or p.get("name") == f.get("name")
-                    for p in previous_items
+                    for p in prev_items
                 )
             ]
-        else:
-            new_items = []
 
         sites_ref.document(site_id).update({
             "items": fetched,
@@ -599,22 +742,22 @@ def main():
         })
 
         success_count += 1
-        print(f"  → 전체 {len(fetched)}개 / 신규 {len(new_items)}개 ({site_elapsed:.1f}s)")
+        total_new += len(new_items)
+        print(f"  → 전체 {len(fetched)}개 / 신규 {len(new_items)}개 ({elapsed_site:.1f}s)")
 
         if new_items:
-            total_new_count += len(new_items)
-            msg_lines = [f"🆕 <b>{name}</b> 신상품 {len(new_items)}건"]
+            msg = [f"🆕 <b>{name}</b> 신상품 {len(new_items)}건"]
             for item in new_items[:5]:
-                msg_lines.append(
-                    f"• <a href='{item.get('link', '#')}'>{item.get('name', '')}</a>"
-                )
+                msg.append(f"• <a href='{item.get('link','#')}'>{item.get('name','')}</a>")
             if len(new_items) > 5:
-                msg_lines.append(f"…외 {len(new_items) - 5}건")
-            send_telegram("\n".join(msg_lines))
+                msg.append(f"…외 {len(new_items)-5}건")
+            send_telegram("\n".join(msg))
+
+        time.sleep(0.5)
 
     total_elapsed = time.time() - start_time
     print(f"\n=== 스캔 완료 ({total_elapsed:.1f}s) ===")
-    print(f"  성공: {success_count}개 / 실패: {fail_count}개 / 신규: {total_new_count}건")
+    print(f"  성공: {success_count} / 실패: {fail_count} / 스킵: {skip_count} / 신규: {total_new}건")
 
 
 if __name__ == "__main__":
