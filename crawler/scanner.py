@@ -172,15 +172,23 @@ def _parse_feed(feed_url: str, use_mobile_ua: bool = False):
             )
             headers["Accept"] = "application/atom+xml, application/rss+xml, application/xml, */*"
 
-        # 1차: 직접 요청
-        resp = requests.get(feed_url, headers=headers, timeout=REQUEST_TIMEOUT)
+        resp = None
 
-        # 직접 요청 실패(403/429 등)하고 프록시 설정 있으면 → 프록시로 재시도
-        if resp.status_code != 200 and CF_PROXY_URL:
-            proxy_url = f"{CF_PROXY_URL}/?url={feed_url}"
-            resp = requests.get(proxy_url, headers=headers, timeout=REQUEST_TIMEOUT)
-            if resp.status_code == 200:
-                print(f"    (프록시 우회 성공)")
+        # 프록시 설정 있으면 먼저 시도 (IP 차단 우회)
+        if CF_PROXY_URL:
+            try:
+                proxy_url = f"{CF_PROXY_URL}/?url={feed_url}"
+                r = requests.get(proxy_url, headers=headers, timeout=REQUEST_TIMEOUT)
+                if r.status_code == 200 and len(r.content) >= 100:
+                    ET.fromstring(r.content)  # XML 파싱 가능 확인
+                    print(f"    (프록시 경유)")
+                    resp = r
+            except Exception:
+                pass  # 프록시 실패 시 직접 요청으로 폴백
+
+        # 프록시 없거나 실패 시 직접 요청
+        if resp is None:
+            resp = requests.get(feed_url, headers=headers, timeout=REQUEST_TIMEOUT)
 
         if resp.status_code != 200 or len(resp.content) < 100:
             return None
