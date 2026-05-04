@@ -103,26 +103,29 @@ def is_blocked_domain(url: str) -> bool:
 # ======================================================================
 def try_rss(site_url: str):
     try:
-        resp = requests.get(site_url, headers=HTTP_HEADERS, timeout=REQUEST_TIMEOUT)
-        if resp.status_code != 200:
-            return None
-
-        soup = BeautifulSoup(resp.text, "html.parser")
-
         candidates = []
 
-        # <link rel="alternate"> 태그에서 RSS 찾기
-        rss_link = soup.find("link", attrs={"type": re.compile(r"application/(rss|atom)\+xml")})
-        if rss_link and rss_link.get("href"):
-            candidates.append(urljoin(site_url, rss_link["href"]))
+        # Shopify /collections/ URL 은 .atom 을 직접 먼저 시도 (페이지 접속 불필요)
+        if "/collections/" in site_url:
+            atom_url = site_url.rstrip("/").split("?")[0] + ".atom"
+            candidates.append(atom_url)
 
-        # 흔한 경로 + Shopify .atom 패턴
+        # 루트 경로의 흔한 RSS 경로들
         for path in ["/rss", "/feed", "/rss.xml", "/feed.xml", "/atom.xml"]:
             candidates.append(urljoin(site_url, path))
 
-        # Shopify collection URL 은 .atom 을 붙이면 바로 피드
-        if "/collections/" in site_url:
-            candidates.append(site_url.rstrip("/").split("?")[0] + ".atom")
+        # 페이지 HTML 에서 RSS 링크 태그 찾기 (위에서 실패할 경우 보조)
+        try:
+            resp = requests.get(site_url, headers=HTTP_HEADERS, timeout=REQUEST_TIMEOUT)
+            if resp.status_code == 200:
+                soup = BeautifulSoup(resp.text, "html.parser")
+                rss_link = soup.find("link", attrs={"type": re.compile(r"application/(rss|atom)\+xml")})
+                if rss_link and rss_link.get("href"):
+                    href = urljoin(site_url, rss_link["href"])
+                    if href not in candidates:
+                        candidates.insert(0, href)  # HTML 에서 찾은 건 우선순위 높임
+        except Exception:
+            pass  # 페이지 접속 실패해도 candidates 로 계속 시도
 
         for rss_url in candidates:
             items = _parse_feed(rss_url)
@@ -332,7 +335,116 @@ def try_site_specific(site_url: str):
         return _parse_nike(site_url)
     if "kasina.co.kr" in hostname:
         return _parse_kasina(site_url)
+    if "salomon.co.kr" in hostname:
+        return _parse_salomon(site_url)
+    if "arcteryx.co.kr" in hostname:
+        return _parse_arcteryx(site_url)
 
+    return None
+
+
+def _parse_salomon(url: str):
+    """살로몬 코리아 - Shopify 계열, .atom 직접 시도"""
+    try:
+        # /collections/ URL 이면 .atom 직접 시도
+        if "/collections/" in url:
+            atom_url = url.rstrip("/").split("?")[0] + ".atom"
+            items = _parse_feed(atom_url)
+            if items:
+                print(f"  ✓ 살로몬 atom: {len(items)}개")
+                return items
+
+        # 신상품 컬렉션 URL 직접 시도
+        for collection in ["new-arrivals", "new-arrivals-all", "gnb-new-arrivals-all", "new"]:
+            atom_url = f"https://www.salomon.co.kr/collections/{collection}.atom"
+            items = _parse_feed(atom_url)
+            if items:
+                print(f"  ✓ 살로몬 atom({collection}): {len(items)}개")
+                return items
+
+        # HTML 파싱 폴백
+        resp = requests.get(url, headers=HTTP_HEADERS, timeout=REQUEST_TIMEOUT)
+        if resp.status_code == 200:
+            soup = BeautifulSoup(resp.text, "html.parser")
+            # Shopify 상품 링크 패턴: /products/상품명
+            links = soup.find_all("a", href=re.compile(r"/products/[a-z0-9-]+"))
+            seen = set()
+            items = []
+            for a in links:
+                href = a.get("href", "")
+                link = urljoin("https://www.salomon.co.kr", href.split("?")[0])
+                if link in seen:
+                    continue
+                seen.add(link)
+                name = ""
+                img = a.find("img")
+                if img:
+                    name = img.get("alt", "").strip()
+                if not name:
+                    name = a.get_text(strip=True)[:80]
+                if name and len(name) > 2:
+                    items.append({"name": name, "link": link})
+                if len(items) >= 10:
+                    break
+            if items:
+                print(f"  ✓ 살로몬 HTML: {len(items)}개")
+                return items
+    except Exception as e:
+        print(f"  살로몬 파서 실패: {e}")
+    return None
+
+
+def _parse_arcteryx(url: str):
+    """아크테릭스 코리아 전용 파서"""
+    try:
+        resp = requests.get(url, headers=HTTP_HEADERS, timeout=REQUEST_TIMEOUT)
+        if resp.status_code != 200:
+            return None
+
+        soup = BeautifulSoup(resp.text, "html.parser")
+
+        # JSON-LD 먼저 시도
+        scripts = soup.find_all("script", {"type": "application/ld+json"})
+        for script in scripts:
+            if not script.string:
+                continue
+            try:
+                data = json.loads(script.string)
+                items = _extract_jsonld_products(data, url)
+                if items:
+                    print(f"  ✓ 아크테릭스 JSON-LD: {len(items)}개")
+                    return items
+            except Exception:
+                continue
+
+        # HTML 파싱: /products/category/ 하위 상품 링크
+        product_re = re.compile(r"/products?/(?!category)[a-z0-9-/]+", re.IGNORECASE)
+        links = soup.find_all("a", href=product_re)
+        seen = set()
+        items = []
+        for a in links:
+            href = a.get("href", "")
+            link = urljoin("https://arcteryx.co.kr", href.split("?")[0])
+            if link in seen:
+                continue
+            seen.add(link)
+            name = ""
+            img = a.find("img")
+            if img:
+                name = img.get("alt", "").strip()
+            if not name:
+                name = a.get_text(strip=True)[:80]
+            if name and len(name) > 2:
+                items.append({"name": name, "link": link})
+            if len(items) >= 10:
+                break
+
+        if items:
+            print(f"  ✓ 아크테릭스 HTML: {len(items)}개")
+            return items
+
+    except Exception as e:
+        print(f"  아크테릭스 파서 실패: {e}")
     return None
 
 
@@ -595,7 +707,7 @@ def crawl_site(site_url: str):
         return None
 
     # Shopify /collections/ URL 은 RSS 가 확실 → RSS 만 먼저 시도
-    if "/collections/" in site_url:
+    if "/collections/" in site_url or "/products/category" in site_url:
         result = try_rss(site_url)
         if result:
             return result
