@@ -176,7 +176,11 @@ def try_sitemap(site_url: str):
         if resp.status_code != 200:
             return None
 
-        root = ET.fromstring(resp.content)
+        try:
+            root = ET.fromstring(resp.content)
+        except ET.ParseError:
+            # sitemap이 XML이 아닌 HTML 등 깨진 형식인 경우 조용히 스킵
+            return None
         ns = {"sm": "http://www.sitemaps.org/schemas/sitemap/0.9"}
 
         all_urls = []
@@ -589,6 +593,12 @@ def crawl_site(site_url: str):
     if is_blocked_domain(site_url):
         print(f"  ⚠ 봇 차단 도메인 (크롤링 불가) - 대시보드에서 수동 확인 권장")
         return None
+
+    # Shopify /collections/ URL 은 RSS 가 확실 → RSS 만 먼저 시도
+    if "/collections/" in site_url:
+        result = try_rss(site_url)
+        if result:
+            return result
 
     # 전략 순서대로 시도
     strategies = [
