@@ -43,6 +43,10 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 APP_ID = os.environ.get("APP_ID", "drake130-app").strip()
 
+# Cloudflare Workers 프록시 URL (IP 차단 우회용)
+# 예: https://rss-proxy.YOUR_SUBDOMAIN.workers.dev
+CF_PROXY_URL = os.environ.get("CF_PROXY_URL", "").strip()
+
 PER_SITE_TIMEOUT = 45  # 사이트당 최대 처리 시간 (초)
 REQUEST_TIMEOUT = 12
 
@@ -168,7 +172,16 @@ def _parse_feed(feed_url: str, use_mobile_ua: bool = False):
             )
             headers["Accept"] = "application/atom+xml, application/rss+xml, application/xml, */*"
 
+        # 1차: 직접 요청
         resp = requests.get(feed_url, headers=headers, timeout=REQUEST_TIMEOUT)
+
+        # 직접 요청 실패(403/429 등)하고 프록시 설정 있으면 → 프록시로 재시도
+        if resp.status_code != 200 and CF_PROXY_URL:
+            proxy_url = f"{CF_PROXY_URL}/?url={feed_url}"
+            resp = requests.get(proxy_url, headers=headers, timeout=REQUEST_TIMEOUT)
+            if resp.status_code == 200:
+                print(f"    (프록시 우회 성공)")
+
         if resp.status_code != 200 or len(resp.content) < 100:
             return None
 
