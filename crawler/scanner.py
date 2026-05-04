@@ -387,9 +387,6 @@ def try_site_specific(site_url: str):
         return _parse_salomon(site_url)
     if "arcteryx.co.kr" in hostname:
         return _parse_arcteryx(site_url)
-    if "worksout.co.kr" in hostname:
-        return _parse_worksout(site_url)
-
     return None
 
 
