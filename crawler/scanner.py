@@ -396,81 +396,113 @@ def try_site_specific(site_url: str):
 def _parse_worksout(url: str):
     """
     웍스아웃 전용 파서.
-    자체 쇼핑몰 (Shopify 아님) → sitemap에서 /products/ 패턴 URL 추출.
+    내부 API: /api/v1/products?categoryId=37&sort=new&size=10
     """
     try:
-        # sitemap에서 상품 URL 직접 추출
-        sitemap_url = "https://www.worksout.co.kr/sitemap.xml"
-        resp = requests.get(sitemap_url, headers=HTTP_HEADERS, timeout=REQUEST_TIMEOUT)
-        if resp.status_code == 200:
+        # 내부 API 시도 (categoryId는 URL에서 추출)
+        cat_match = re.search(r"mainCategoryId=(\d+)", url)
+        cat_id = cat_match.group(1) if cat_match else "37"
+
+        api_urls = [
+            f"https://www.worksout.co.kr/api/v1/products?mainCategoryId={cat_id}&sort=new&size=10&page=1",
+            f"https://www.worksout.co.kr/api/products?mainCategoryId={cat_id}&sortType=new&pageSize=10&pageNo=1",
+            f"https://www.worksout.co.kr/api/v2/products?mainCategoryId={cat_id}&sort=newest&limit=10",
+        ]
+
+        api_headers = {
+            **HTTP_HEADERS,
+            "Accept": "application/json",
+            "Referer": "https://www.worksout.co.kr/",
+            "X-Requested-With": "XMLHttpRequest",
+        }
+
+        for api_url in api_urls:
             try:
-                root = ET.fromstring(resp.content)
-                ns = {"sm": "http://www.sitemaps.org/schemas/sitemap/0.9"}
-
-                all_urls = []
-                # sitemap index 처리
-                sitemaps = root.findall("sm:sitemap", ns)
-                if sitemaps:
-                    for sm in sitemaps[:5]:
-                        loc = sm.find("sm:loc", ns)
-                        if loc is not None and loc.text:
-                            all_urls.extend(_fetch_sitemap_urls(loc.text.strip()))
-                else:
-                    all_urls = _parse_sitemap_root(root, ns)
-
-                # 상품 URL 패턴 필터 (웍스아웃: /products/숫자 또는 /goods/ 패턴)
-                product_re = re.compile(r"/(products?|goods)/\d+", re.IGNORECASE)
-                products = [u for u in all_urls if product_re.search(u["link"])]
-
-                # 최신순 정렬
-                products.sort(key=lambda x: x.get("lastmod", ""), reverse=True)
-
-                if products:
-                    items = []
-                    for u in products[:10]:
-                        raw = u["link"].rstrip("/").split("/")[-1].split("?")[0]
-                        name = re.sub(r"[-_]", " ", raw)[:80] or u["link"]
-                        items.append({"name": name, "link": u["link"]})
-                    print(f"  ✓ 웍스아웃 sitemap: {len(items)}개")
-                    return items
-            except ET.ParseError:
-                pass
-
-        # sitemap 실패 시 카테고리 페이지 HTML 직접 파싱
-        resp = requests.get(url, headers=HTTP_HEADERS, timeout=REQUEST_TIMEOUT)
-        if resp.status_code != 200:
-            return None
-
-        soup = BeautifulSoup(resp.text, "html.parser")
-        product_re = re.compile(r"/(products?|goods)/\d+", re.IGNORECASE)
-        links = soup.find_all("a", href=product_re)
-
-        seen = set()
-        items = []
-        for a in links:
-            href = a.get("href", "")
-            link = urljoin("https://www.worksout.co.kr", href.split("?")[0])
-            if link in seen:
+                resp = requests.get(api_url, headers=api_headers, timeout=REQUEST_TIMEOUT)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    items = _extract_worksout_items(data)
+                    if items:
+                        print(f"  ✓ 웍스아웃 API: {len(items)}개")
+                        return items
+            except Exception:
                 continue
-            seen.add(link)
-            name = ""
-            img = a.find("img")
-            if img:
-                name = img.get("alt", "").strip()
-            if not name:
-                name = a.get_text(strip=True)[:80]
-            if name and len(name) > 2:
-                items.append({"name": name, "link": link})
-            if len(items) >= 10:
-                break
 
-        if items:
-            print(f"  ✓ 웍스아웃 HTML: {len(items)}개")
-            return items
+        # API 실패 시 Next.js __NEXT_DATA__ 파싱
+        resp = requests.get(url, headers=HTTP_HEADERS, timeout=REQUEST_TIMEOUT)
+        if resp.status_code == 200:
+            soup = BeautifulSoup(resp.text, "html.parser")
+            next_data = soup.find("script", id="__NEXT_DATA__")
+            if next_data and next_data.string:
+                try:
+                    data = json.loads(next_data.string)
+                    items = _deep_find_products(data, "https://www.worksout.co.kr")
+                    if items:
+                        print(f"  ✓ 웍스아웃 __NEXT_DATA__: {len(items)}개")
+                        return items
+                except Exception:
+                    pass
+
+            # HTML에서 상품 링크 패턴 직접 추출
+            product_re = re.compile(r"/products/\d+")
+            links = soup.find_all("a", href=product_re)
+            seen = set()
+            items = []
+            for a in links:
+                href = a.get("href", "")
+                link = urljoin("https://www.worksout.co.kr", href.split("?")[0])
+                if link in seen:
+                    continue
+                seen.add(link)
+                name = ""
+                img = a.find("img")
+                if img:
+                    name = img.get("alt", "").strip()
+                if not name:
+                    name = a.get_text(strip=True)[:80]
+                if name and len(name) > 2:
+                    items.append({"name": name, "link": link})
+                if len(items) >= 10:
+                    break
+            if items:
+                print(f"  ✓ 웍스아웃 HTML: {len(items)}개")
+                return items
 
     except Exception as e:
         print(f"  웍스아웃 파서 실패: {e}")
     return None
+
+
+def _extract_worksout_items(data):
+    """웍스아웃 API 응답에서 상품 목록 추출"""
+    candidates = []
+
+    def find_lists(obj, depth=0):
+        if depth > 6:
+            return
+        if isinstance(obj, list) and obj and isinstance(obj[0], dict):
+            keys = set(obj[0].keys())
+            if keys & {"productNo", "productId", "id", "no"} and                keys & {"productName", "name", "title"}:
+                candidates.append(obj)
+        elif isinstance(obj, dict):
+            for v in obj.values():
+                find_lists(v, depth + 1)
+
+    find_lists(data)
+    if not candidates:
+        return []
+
+    products = max(candidates, key=len)
+    items = []
+    for p in products[:10]:
+        name = p.get("productName") or p.get("name") or p.get("title") or ""
+        pid = p.get("productNo") or p.get("productId") or p.get("id") or p.get("no") or ""
+        if name and pid:
+            items.append({
+                "name": str(name).strip(),
+                "link": f"https://www.worksout.co.kr/products/{pid}",
+            })
+    return items
 
 
 def _parse_salomon(url: str):
@@ -525,30 +557,63 @@ def _parse_salomon(url: str):
 
 
 def _parse_arcteryx(url: str):
-    """아크테릭스 코리아 전용 파서"""
+    """
+    아크테릭스 코리아 전용 파서.
+    내부 API: /api/products?categoryId=102&sort=new&size=10
+    상품 URL: /products/view/숫자
+    """
     try:
+        # URL 에서 카테고리 번호 추출
+        cat_match = re.search(r"/category/(\d+)", url)
+        cat_id = cat_match.group(1) if cat_match else "102"
+
+        # 내부 API 후보들
+        api_urls = [
+            f"https://arcteryx.co.kr/api/v1/products?categoryId={cat_id}&sort=new&size=10&page=1",
+            f"https://arcteryx.co.kr/api/products?categoryId={cat_id}&sortType=new&pageSize=10",
+            f"https://arcteryx.co.kr/api/v1/category/{cat_id}/products?sort=newest&limit=10",
+        ]
+
+        api_headers = {
+            **HTTP_HEADERS,
+            "Accept": "application/json",
+            "Referer": "https://arcteryx.co.kr/",
+            "X-Requested-With": "XMLHttpRequest",
+        }
+
+        for api_url in api_urls:
+            try:
+                resp = requests.get(api_url, headers=api_headers, timeout=REQUEST_TIMEOUT)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    items = _extract_arcteryx_items(data)
+                    if items:
+                        print(f"  ✓ 아크테릭스 API: {len(items)}개")
+                        return items
+            except Exception:
+                continue
+
+        # API 실패 → 카테고리 페이지 HTML에서 상품 링크 추출
         resp = requests.get(url, headers=HTTP_HEADERS, timeout=REQUEST_TIMEOUT)
         if resp.status_code != 200:
             return None
 
         soup = BeautifulSoup(resp.text, "html.parser")
 
-        # JSON-LD 먼저 시도
-        scripts = soup.find_all("script", {"type": "application/ld+json"})
-        for script in scripts:
-            if not script.string:
-                continue
+        # Next.js __NEXT_DATA__ 시도
+        next_data = soup.find("script", id="__NEXT_DATA__")
+        if next_data and next_data.string:
             try:
-                data = json.loads(script.string)
-                items = _extract_jsonld_products(data, url)
+                data = json.loads(next_data.string)
+                items = _deep_find_products(data, "https://arcteryx.co.kr")
                 if items:
-                    print(f"  ✓ 아크테릭스 JSON-LD: {len(items)}개")
+                    print(f"  ✓ 아크테릭스 __NEXT_DATA__: {len(items)}개")
                     return items
             except Exception:
-                continue
+                pass
 
-        # HTML 파싱: /products/category/ 하위 상품 링크
-        product_re = re.compile(r"/products?/(?!category)[a-z0-9-/]+", re.IGNORECASE)
+        # HTML 링크 패턴: /products/view/숫자
+        product_re = re.compile(r"/products/view/\d+")
         links = soup.find_all("a", href=product_re)
         seen = set()
         items = []
@@ -558,12 +623,11 @@ def _parse_arcteryx(url: str):
             if link in seen:
                 continue
             seen.add(link)
-            name = ""
-            img = a.find("img")
-            if img:
-                name = img.get("alt", "").strip()
+            name = a.get_text(strip=True)[:80]
             if not name:
-                name = a.get_text(strip=True)[:80]
+                img = a.find("img")
+                if img:
+                    name = img.get("alt", "").strip()
             if name and len(name) > 2:
                 items.append({"name": name, "link": link})
             if len(items) >= 10:
@@ -576,6 +640,40 @@ def _parse_arcteryx(url: str):
     except Exception as e:
         print(f"  아크테릭스 파서 실패: {e}")
     return None
+
+
+def _extract_arcteryx_items(data):
+    """아크테릭스 API 응답에서 상품 목록 추출"""
+    candidates = []
+
+    def find_lists(obj, depth=0):
+        if depth > 6:
+            return
+        if isinstance(obj, list) and obj and isinstance(obj[0], dict):
+            keys = set(obj[0].keys())
+            if keys & {"productNo", "productId", "id", "goodsNo"} and                keys & {"productName", "name", "title", "goodsName"}:
+                candidates.append(obj)
+        elif isinstance(obj, dict):
+            for v in obj.values():
+                find_lists(v, depth + 1)
+
+    find_lists(data)
+    if not candidates:
+        return []
+
+    products = max(candidates, key=len)
+    items = []
+    for p in products[:10]:
+        name = (p.get("productName") or p.get("name") or
+                p.get("title") or p.get("goodsName") or "")
+        pid = (p.get("productNo") or p.get("productId") or
+               p.get("id") or p.get("goodsNo") or "")
+        if name and pid:
+            items.append({
+                "name": str(name).strip(),
+                "link": f"https://arcteryx.co.kr/products/view/{pid}",
+            })
+    return items
 
 
 def _parse_nike(url: str):
