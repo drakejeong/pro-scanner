@@ -1,0 +1,38 @@
+name: PRO Scanner Hourly Crawl
+
+on:
+  schedule:
+    # 매시 정각에 실행 (UTC 기준, KST와 무관하게 1시간 주기)
+    - cron: '0 * * * *'
+  # 수동 실행도 가능하게
+  workflow_dispatch:
+
+jobs:
+  crawl:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+          cache-dependency-path: 'crawler/requirements.txt'
+
+      - name: Install dependencies
+        working-directory: ./crawler
+        run: pip install -r requirements.txt
+
+      - name: Run scanner
+        working-directory: ./crawler
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          FIREBASE_CREDENTIALS_JSON: ${{ secrets.FIREBASE_CREDENTIALS_JSON }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          APP_ID: drake130-app
+        run: python scanner.py
