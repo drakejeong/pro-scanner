@@ -30,9 +30,9 @@ jobs:
       - name: Run scanner
         working-directory: ./crawler
         env:
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           FIREBASE_CREDENTIALS_JSON: ${{ secrets.FIREBASE_CREDENTIALS_JSON }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          CF_PROXY_URL: ${{ secrets.CF_PROXY_URL }}
           APP_ID: drake130-app
         run: python scanner.py
