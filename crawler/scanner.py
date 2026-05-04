@@ -105,16 +105,20 @@ def try_rss(site_url: str):
     try:
         candidates = []
 
-        # Shopify /collections/ URL 은 .atom 을 직접 먼저 시도 (페이지 접속 불필요)
+        # Shopify /collections/ URL → .atom 직접 시도
         if "/collections/" in site_url:
             atom_url = site_url.rstrip("/").split("?")[0] + ".atom"
             candidates.append(atom_url)
+            # new-arrivals 계열 컬렉션도 추가 시도
+            base = urljoin(site_url, "/collections/")
+            for col in ["new-arrivals", "new-arrivals-all", "new", "all"]:
+                candidates.append(f"{base}{col}.atom")
 
         # 루트 경로의 흔한 RSS 경로들
         for path in ["/rss", "/feed", "/rss.xml", "/feed.xml", "/atom.xml"]:
             candidates.append(urljoin(site_url, path))
 
-        # 페이지 HTML 에서 RSS 링크 태그 찾기 (위에서 실패할 경우 보조)
+        # 페이지 HTML 에서 RSS 링크 태그 찾기
         try:
             resp = requests.get(site_url, headers=HTTP_HEADERS, timeout=REQUEST_TIMEOUT)
             if resp.status_code == 200:
@@ -123,14 +127,29 @@ def try_rss(site_url: str):
                 if rss_link and rss_link.get("href"):
                     href = urljoin(site_url, rss_link["href"])
                     if href not in candidates:
-                        candidates.insert(0, href)  # HTML 에서 찾은 건 우선순위 높임
+                        candidates.insert(0, href)
         except Exception:
-            pass  # 페이지 접속 실패해도 candidates 로 계속 시도
+            pass
 
-        for rss_url in candidates:
+        # 중복 제거
+        seen = set()
+        unique_candidates = []
+        for c in candidates:
+            if c not in seen:
+                seen.add(c)
+                unique_candidates.append(c)
+
+        for rss_url in unique_candidates:
+            # 일반 헤더로 먼저 시도
             items = _parse_feed(rss_url)
             if items:
                 print(f"  ✓ RSS: {rss_url}")
+                return items[:10]
+
+            # 실패 시 모바일 User-Agent로 재시도 (일부 사이트 IP 차단 우회)
+            items = _parse_feed(rss_url, use_mobile_ua=True)
+            if items:
+                print(f"  ✓ RSS (mobile-ua): {rss_url}")
                 return items[:10]
 
     except Exception as e:
@@ -139,9 +158,17 @@ def try_rss(site_url: str):
     return None
 
 
-def _parse_feed(feed_url: str):
+def _parse_feed(feed_url: str, use_mobile_ua: bool = False):
     try:
-        resp = requests.get(feed_url, headers=HTTP_HEADERS, timeout=REQUEST_TIMEOUT)
+        headers = dict(HTTP_HEADERS)
+        if use_mobile_ua:
+            headers["User-Agent"] = (
+                "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+                "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
+            )
+            headers["Accept"] = "application/atom+xml, application/rss+xml, application/xml, */*"
+
+        resp = requests.get(feed_url, headers=headers, timeout=REQUEST_TIMEOUT)
         if resp.status_code != 200 or len(resp.content) < 100:
             return None
 
@@ -339,7 +366,89 @@ def try_site_specific(site_url: str):
         return _parse_salomon(site_url)
     if "arcteryx.co.kr" in hostname:
         return _parse_arcteryx(site_url)
+    if "worksout.co.kr" in hostname:
+        return _parse_worksout(site_url)
 
+    return None
+
+
+def _parse_worksout(url: str):
+    """
+    웍스아웃 전용 파서.
+    자체 쇼핑몰 (Shopify 아님) → sitemap에서 /products/ 패턴 URL 추출.
+    """
+    try:
+        # sitemap에서 상품 URL 직접 추출
+        sitemap_url = "https://www.worksout.co.kr/sitemap.xml"
+        resp = requests.get(sitemap_url, headers=HTTP_HEADERS, timeout=REQUEST_TIMEOUT)
+        if resp.status_code == 200:
+            try:
+                root = ET.fromstring(resp.content)
+                ns = {"sm": "http://www.sitemaps.org/schemas/sitemap/0.9"}
+
+                all_urls = []
+                # sitemap index 처리
+                sitemaps = root.findall("sm:sitemap", ns)
+                if sitemaps:
+                    for sm in sitemaps[:5]:
+                        loc = sm.find("sm:loc", ns)
+                        if loc is not None and loc.text:
+                            all_urls.extend(_fetch_sitemap_urls(loc.text.strip()))
+                else:
+                    all_urls = _parse_sitemap_root(root, ns)
+
+                # 상품 URL 패턴 필터 (웍스아웃: /products/숫자 또는 /goods/ 패턴)
+                product_re = re.compile(r"/(products?|goods)/\d+", re.IGNORECASE)
+                products = [u for u in all_urls if product_re.search(u["link"])]
+
+                # 최신순 정렬
+                products.sort(key=lambda x: x.get("lastmod", ""), reverse=True)
+
+                if products:
+                    items = []
+                    for u in products[:10]:
+                        raw = u["link"].rstrip("/").split("/")[-1].split("?")[0]
+                        name = re.sub(r"[-_]", " ", raw)[:80] or u["link"]
+                        items.append({"name": name, "link": u["link"]})
+                    print(f"  ✓ 웍스아웃 sitemap: {len(items)}개")
+                    return items
+            except ET.ParseError:
+                pass
+
+        # sitemap 실패 시 카테고리 페이지 HTML 직접 파싱
+        resp = requests.get(url, headers=HTTP_HEADERS, timeout=REQUEST_TIMEOUT)
+        if resp.status_code != 200:
+            return None
+
+        soup = BeautifulSoup(resp.text, "html.parser")
+        product_re = re.compile(r"/(products?|goods)/\d+", re.IGNORECASE)
+        links = soup.find_all("a", href=product_re)
+
+        seen = set()
+        items = []
+        for a in links:
+            href = a.get("href", "")
+            link = urljoin("https://www.worksout.co.kr", href.split("?")[0])
+            if link in seen:
+                continue
+            seen.add(link)
+            name = ""
+            img = a.find("img")
+            if img:
+                name = img.get("alt", "").strip()
+            if not name:
+                name = a.get_text(strip=True)[:80]
+            if name and len(name) > 2:
+                items.append({"name": name, "link": link})
+            if len(items) >= 10:
+                break
+
+        if items:
+            print(f"  ✓ 웍스아웃 HTML: {len(items)}개")
+            return items
+
+    except Exception as e:
+        print(f"  웍스아웃 파서 실패: {e}")
     return None
 
 
