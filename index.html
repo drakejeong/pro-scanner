@@ -4,6 +4,9 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>PRO Scanner - 신규 상품 모니터링</title>
+    <!-- 파비콘 (SVG 인라인) -->
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='22' fill='%232563eb'/><path d='M28 30h24c8 0 14 5 14 13s-6 13-14 13H38v14H28V30zm10 18h13c3 0 5-2 5-5s-2-5-5-5H38v10z' fill='white'/></svg>">
+    <link rel="apple-touch-icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='22' fill='%232563eb'/><path d='M28 30h24c8 0 14 5 14 13s-6 13-14 13H38v14H28V30zm10 18h13c3 0 5-2 5-5s-2-5-5-5H38v10z' fill='white'/></svg>">
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://unpkg.com/lucide@latest"></script>
     <style>
@@ -13,7 +16,7 @@
         .custom-scrollbar::-webkit-scrollbar-track { background: transparent; }
         .custom-scrollbar::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 10px; }
         .custom-scrollbar::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
-        #modal.hidden, #confirm-modal.hidden, #toast.hidden { display: none; }
+        #modal.hidden, #edit-modal.hidden, #confirm-modal.hidden, #toast.hidden { display: none; }
     </style>
 </head>
 <body class="min-h-screen bg-[#f8fafc] text-slate-900 selection:bg-blue-100">
@@ -37,7 +40,6 @@
                 </div>
                 <p class="text-slate-500 font-medium ml-1">서버 자동 모니터링 (1시간 주기) · 텔레그램 알림</p>
             </div>
-
             <div class="flex flex-wrap items-center gap-4">
                 <div class="flex items-center gap-4 bg-white/90 backdrop-blur-md px-6 py-4 rounded-2xl border border-slate-200 shadow-sm">
                     <div class="flex items-center gap-2">
@@ -88,6 +90,33 @@
         </div>
     </div>
 
+    <!-- Edit Site Modal -->
+    <div id="edit-modal" class="hidden fixed inset-0 z-[110] flex items-center justify-center p-4">
+        <div class="absolute inset-0 bg-slate-900/40 backdrop-blur-sm" onclick="closeEditModal()"></div>
+        <div class="relative bg-white w-full max-w-lg rounded-3xl shadow-2xl overflow-hidden">
+            <div class="p-8">
+                <div class="flex justify-between items-center mb-6">
+                    <h2 class="text-2xl font-bold tracking-tight">사이트 수정</h2>
+                    <button onclick="closeEditModal()" class="p-2 hover:bg-slate-100 rounded-full"><i data-lucide="x"></i></button>
+                </div>
+                <div class="space-y-4">
+                    <div class="space-y-1.5">
+                        <label class="text-sm font-bold text-slate-500 ml-1">브랜드 명칭</label>
+                        <input id="edit-site-name" type="text" placeholder="예: 나이키 코리아" class="w-full p-4 bg-slate-50 rounded-2xl border border-slate-200 focus:border-blue-500 focus:ring-4 focus:ring-blue-50 outline-none transition-all">
+                    </div>
+                    <div class="space-y-1.5">
+                        <label class="text-sm font-bold text-slate-500 ml-1">대상 URL</label>
+                        <input id="edit-site-url" type="url" placeholder="https://..." class="w-full p-4 bg-slate-50 rounded-2xl border border-slate-200 focus:border-blue-500 focus:ring-4 focus:ring-blue-50 outline-none transition-all font-mono text-sm">
+                    </div>
+                </div>
+                <button onclick="saveSiteEdit()" class="w-full mt-8 py-4 bg-blue-600 hover:bg-blue-700 text-white rounded-2xl font-bold shadow-lg shadow-blue-100 transition-all active:scale-[0.98]">
+                    저장
+                </button>
+                <p class="text-xs text-slate-400 mt-4 text-center">URL 변경 시 다음 스캔에서 새로 크롤링됩니다.</p>
+            </div>
+        </div>
+    </div>
+
     <!-- Confirm Modal -->
     <div id="confirm-modal" class="hidden fixed inset-0 z-[200] flex items-center justify-center p-4">
         <div class="absolute inset-0 bg-slate-900/60 backdrop-blur-sm"></div>
@@ -115,11 +144,10 @@
     <script type="module">
         import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
         import { getAuth, signInAnonymously, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
-        import { getFirestore, collection, doc, setDoc, deleteDoc, onSnapshot } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        import { getFirestore, collection, doc, setDoc, updateDoc, deleteDoc, onSnapshot } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
 
-        // Firebase 설정 (공개되어도 무방한 클라이언트 키)
         const firebaseConfig = {
-            apiKey: "AIzaSyCfBx89_kQR9Htqb8VokuIrB5NCA3cC7ps",
+            apiKey: "AIzaSyCrkAiyAl7hCLOvsItxQ1nCBOjrMCXJiJ4",
             authDomain: "drake130-8d318.firebaseapp.com",
             projectId: "drake130-8d318",
             storageBucket: "drake130-8d318.firebasestorage.app",
@@ -132,13 +160,13 @@
         let app, auth, db;
         let sites = [];
         let deleteTargetId = null;
+        let editTargetId = null;
 
         async function initFirebase() {
             try {
                 app = initializeApp(firebaseConfig);
                 auth = getAuth(app);
                 db = getFirestore(app);
-
                 await signInAnonymously(auth);
 
                 onAuthStateChanged(auth, (user) => {
@@ -163,17 +191,12 @@
             }
         }
 
+        // 사이트 추가
         window.addSite = async () => {
-            if (!auth?.currentUser) {
-                showToast("로그인 처리 중입니다. 잠시만 기다려주세요.");
-                return;
-            }
+            if (!auth?.currentUser) { showToast("로그인 처리 중입니다."); return; }
             const name = document.getElementById('new-site-name').value.trim();
             const url = document.getElementById('new-site-url').value.trim();
-            if (!name || !url) {
-                showToast("이름과 URL을 모두 입력해주세요.");
-                return;
-            }
+            if (!name || !url) { showToast("이름과 URL을 모두 입력해주세요."); return; }
             const siteId = Date.now().toString();
             try {
                 await setDoc(
@@ -184,11 +207,55 @@
                 document.getElementById('new-site-url').value = '';
                 toggleModal(false);
                 showToast("등록 완료. 다음 정시 스캔에 반영됩니다.");
-            } catch (e) {
-                showToast(`저장 실패: ${e.message}`, true);
-            }
+            } catch (e) { showToast(`저장 실패: ${e.message}`, true); }
         };
 
+        // 수정 모달 열기
+        window.openEditModal = (id) => {
+            const site = sites.find(s => s.id === id);
+            if (!site) return;
+            editTargetId = id;
+            document.getElementById('edit-site-name').value = site.name || '';
+            document.getElementById('edit-site-url').value = site.url || '';
+            document.getElementById('edit-modal').classList.remove('hidden');
+            lucide.createIcons();
+        };
+
+        // 수정 모달 닫기
+        window.closeEditModal = () => {
+            document.getElementById('edit-modal').classList.add('hidden');
+            editTargetId = null;
+        };
+
+        // 수정 저장
+        window.saveSiteEdit = async () => {
+            if (!editTargetId) return;
+            const name = document.getElementById('edit-site-name').value.trim();
+            const url = document.getElementById('edit-site-url').value.trim();
+            if (!name || !url) { showToast("이름과 URL을 모두 입력해주세요."); return; }
+
+            const site = sites.find(s => s.id === editTargetId);
+            const urlChanged = site && site.url !== url;
+
+            try {
+                const updateData = { name, url };
+                // URL이 바뀌면 기존 크롤링 데이터 초기화 (새 URL로 다시 스캔)
+                if (urlChanged) {
+                    updateData.items = [];
+                    updateData.newItems = [];
+                    updateData.lastUpdated = null;
+                    updateData.lastError = null;
+                }
+                await updateDoc(
+                    doc(db, 'artifacts', APP_ID, 'public', 'data', 'monitoring_sites', editTargetId),
+                    updateData
+                );
+                closeEditModal();
+                showToast(urlChanged ? "수정 완료. 다음 스캔에서 새로 크롤링됩니다." : "수정 완료.");
+            } catch (e) { showToast(`수정 실패: ${e.message}`, true); }
+        };
+
+        // 삭제
         window.deleteSite = (id) => {
             deleteTargetId = id;
             document.getElementById('confirm-modal').classList.remove('hidden');
@@ -197,9 +264,7 @@
                     await deleteDoc(doc(db, 'artifacts', APP_ID, 'public', 'data', 'monitoring_sites', deleteTargetId));
                     closeConfirm();
                     showToast("삭제되었습니다.");
-                } catch (e) {
-                    showToast("삭제 중 오류가 발생했습니다.", true);
-                }
+                } catch (e) { showToast("삭제 중 오류가 발생했습니다.", true); }
             };
         };
 
@@ -248,42 +313,57 @@
             }
 
             grid.innerHTML = sites.map(site => {
-                let host = "URL 분석 중...";
+                let host = "";
                 try { host = new URL(site.url).hostname; } catch (e) {}
-                const newCount = (site.newItems || []).length;
+                const newItems = site.newItems || [];
+                const newCount = newItems.length;
                 const hasError = !!site.lastError;
+
+                // 신규 상품이 있으면 신규만, 없으면 전체 items 표시
+                const displayItems = newCount > 0 ? newItems : (site.items || []);
+                const showingNew = newCount > 0;
 
                 return `
                 <div class="group bg-white rounded-[2.5rem] shadow-sm border border-slate-200 overflow-hidden flex flex-col transition-all duration-500 hover:shadow-2xl hover:-translate-y-2 ${hasError ? 'ring-2 ring-red-100' : ''}">
                     <div class="p-8 bg-gradient-to-br ${getGradient(site.name)} text-white relative">
                         <div class="flex justify-between items-start mb-6">
                             <div class="flex items-center gap-2 bg-white/20 backdrop-blur-md px-3 py-1 rounded-full text-[10px] font-black uppercase tracking-widest">Server Sync</div>
-                            <button onclick="deleteSite('${site.id}')" class="p-2 opacity-0 group-hover:opacity-100 transition-opacity hover:bg-white/20 rounded-xl"><i data-lucide="trash-2" class="w-4 h-4"></i></button>
+                            <div class="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+                                <button onclick="openEditModal('${site.id}')" class="p-2 hover:bg-white/20 rounded-xl" title="수정">
+                                    <i data-lucide="pencil" class="w-4 h-4"></i>
+                                </button>
+                                <button onclick="deleteSite('${site.id}')" class="p-2 hover:bg-white/20 rounded-xl" title="삭제">
+                                    <i data-lucide="trash-2" class="w-4 h-4"></i>
+                                </button>
+                            </div>
                         </div>
                         <h3 class="text-3xl font-black mb-1 drop-shadow-md leading-none truncate">${site.name}</h3>
-                        <div class="flex items-center gap-1.5 text-white/80 text-xs font-medium"><i data-lucide="globe" class="w-3 h-3"></i><span class="truncate opacity-70">${host}</span></div>
+                        <div class="flex items-center gap-1.5 text-white/80 text-xs font-medium">
+                            <i data-lucide="globe" class="w-3 h-3"></i>
+                            <span class="truncate opacity-70">${host}</span>
+                        </div>
                     </div>
                     <div class="p-8 flex-1 flex flex-col bg-white">
                         <div class="flex items-center justify-between mb-6">
                             <h4 class="text-[10px] font-black text-slate-400 uppercase tracking-[0.2em]">
-                                Latest Items ${newCount > 0 ? `<span class="text-blue-500 ml-1 font-bold">(신규 ${newCount}건)</span>` : ''}
+                                ${showingNew
+                                    ? `<span class="text-blue-500">🆕 신규 ${newCount}건</span>`
+                                    : `Latest Items`}
                             </h4>
+                            ${showingNew ? `<span class="text-[9px] text-slate-300 font-bold">다음 스캔 시 갱신</span>` : ''}
                         </div>
                         <div class="space-y-3 flex-1 overflow-y-auto max-h-[350px] pr-2 custom-scrollbar">
-                            ${(site.items && site.items.length > 0) ? site.items.map(item => {
-                                const isNew = (site.newItems || []).some(n => n.link === item.link || n.name === item.name);
-                                return `
+                            ${displayItems.length > 0 ? displayItems.map(item => `
                                 <a href="${item.link}" target="_blank" class="group/item flex items-center justify-between p-5 bg-slate-50 hover:bg-slate-900 border border-slate-100 rounded-3xl transition-all duration-300">
                                     <div class="flex flex-col gap-1 min-w-0">
                                         <div class="flex items-center gap-2">
-                                            ${isNew ? '<span class="bg-blue-600 text-[8px] text-white px-2 py-0.5 rounded-full font-black shadow-sm shadow-blue-200">NEW</span>' : ''}
-                                            <span class="text-[13px] font-bold ${isNew ? 'text-blue-600' : 'text-slate-800'} group-hover/item:text-white truncate transition-colors">${item.name}</span>
+                                            ${showingNew ? '<span class="bg-blue-600 text-[8px] text-white px-2 py-0.5 rounded-full font-black shadow-sm shadow-blue-200 shrink-0">NEW</span>' : ''}
+                                            <span class="text-[13px] font-bold ${showingNew ? 'text-blue-600' : 'text-slate-800'} group-hover/item:text-white truncate transition-colors">${item.name}</span>
                                         </div>
                                     </div>
-                                    <i data-lucide="external-link" class="w-3.5 h-3.5 text-slate-300 group-hover/item:text-white/50 shrink-0"></i>
+                                    <i data-lucide="external-link" class="w-3.5 h-3.5 text-slate-300 group-hover/item:text-white/50 shrink-0 ml-2"></i>
                                 </a>
-                                `;
-                            }).join('') : '<div class="py-16 text-center opacity-30 text-[10px] font-black font-sans">스캔 대기 중</div>'}
+                            `).join('') : '<div class="py-16 text-center opacity-30 text-[10px] font-black font-sans">스캔 대기 중</div>'}
                         </div>
                         ${hasError ? `<div class="mt-6 p-3 bg-red-50 text-red-600 text-[11px] font-bold rounded-2xl">⚠ ${site.lastError}</div>` : ''}
                         <div class="mt-6 pt-5 border-t border-slate-50 flex items-center justify-between text-[9px] font-black text-slate-400 tracking-wider">
